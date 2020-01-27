@@ -1,117 +1,199 @@
-# -*- coding: utf-8 -*-
+# -*- coding:utf-8 -*-
+# Author : zhaijianwei
+# Date : 2019/6/19 19:48
 
-import gym
-import time
-import random
-import numpy as np
 import tensorflow as tf
-from collections import deque
+import numpy as np
+from tensorflow.keras import layers
+from tensorflow.keras.optimizers import RMSprop
 
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
-import os
-from tensorflow.keras.models import load_model
-from tensorflow.keras import backend as K
-
-EPISODES = 3000
+from maze_env import Maze
 
 
-class DQN(object):
-    def __init__(self, state_size, action_size, dd=True):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.memory = deque(maxlen=3000)
-        self.gamma = 0.99  # discount rate
-        self.epsilon = 1.0  # exploration rate
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
-        self.learning_rate = 0.001
-        self.train_batch = 32
-        self._model = self._createModel(dd)
+class Eval_Model(tf.keras.Model):
+    def __init__(self, num_actions):
+        super().__init__('mlp_q_network')
+        self.layer1 = layers.Dense(10, activation='relu')
+        self.logits = layers.Dense(num_actions, activation=None)
 
-    @property
-    def model(self):  # 定义为只读属性
-        return self._model
+    def call(self, inputs):
+        x = tf.convert_to_tensor(inputs)
+        layer1 = self.layer1(x)
+        logits = self.logits(layer1)
+        return logits
 
-    def _huber_loss(self, target, prediction):
-        # sqrt(1+error^2)-1
-        error = prediction - target
-        return K.mean(K.sqrt(1 + K.square(error)) - 1, axis=-1)
 
-    def _createModel(self, dd=True):
-        model = tf.keras.models.Sequential()
-        model.add(Dense(24, input_dim=self.state_size, activation='relu'))
-        model.add(Dense(24, activation='relu'))
-        model.add(Dense(self.action_size, activation='linear'))
-        if dd:
-            model.compile(loss=self._huber_loss, optimizer=Adam(lr=self.learning_rate))
+class Target_Model(tf.keras.Model):
+    def __init__(self, num_actions):
+        super().__init__('mlp_q_network_1')
+        self.layer1 = layers.Dense(10, trainable=False, activation='relu')
+        self.logits = layers.Dense(num_actions, trainable=False, activation=None)
+
+    def call(self, inputs):
+        x = tf.convert_to_tensor(inputs)
+        layer1 = self.layer1(x)
+        logits = self.logits(layer1)
+        return logits
+
+
+class DeepQNetwork:
+    def __init__(self, n_actions, n_features, eval_model, target_model):
+
+        self.params = {
+            'n_actions': n_actions,
+            'n_features': n_features,
+            'learning_rate': 0.01,
+            'reward_decay': 0.9,
+            'e_greedy': 0.9,
+            'replace_target_iter': 300,
+            'memory_size': 500,
+            'batch_size': 32,
+            'e_greedy_increment': None
+        }
+
+        # total learning step
+
+        self.learn_step_counter = 0
+
+        # initialize zero memory [s, a, r, s_]
+        self.epsilon = 0 if self.params['e_greedy_increment'] is not None else self.params['e_greedy']
+        self.memory = np.zeros((self.params['memory_size'], self.params['n_features'] * 2 + 2))
+
+        self.eval_model = eval_model
+        self.target_model = target_model
+
+        self.eval_model.compile(
+            optimizer=RMSprop(lr=self.params['learning_rate']),
+            loss='mse'
+        )
+        self.cost_his = []
+
+    def store_transition(self, s, a, r, s_):
+        if not hasattr(self, 'memory_counter'):
+            self.memory_counter = 0
+
+        transition = np.hstack((s, [a, r], s_))
+
+        # replace the old memory with new memory
+        index = self.memory_counter % self.params['memory_size']
+        self.memory[index, :] = transition
+
+        self.memory_counter += 1
+
+    def choose_action(self, observation):
+        # to have batch dimension when feed into tf placeholder
+        observation = observation[np.newaxis, :]
+
+        if np.random.uniform() < self.epsilon:
+            # forward feed the observation and get q value for every actions
+            actions_value = self.eval_model.predict(observation)
+            print(actions_value)
+            action = np.argmax(actions_value)
         else:
-            model.compile(loss='mse', optimizer=Adam(lr=self.learning_rate))
-        return model
+            action = np.random.randint(0, self.params['n_actions'])
+        return action
 
-    def train(self):
-        if len(self.memory) >= self.train_batch:
-            minibatch = random.sample(self.memory, self.train_batch)
-            state_batch = np.zeros([self.train_batch, self.state_size])
-            target_batch = np.zeros([self.train_batch, self.action_size])
-            for i, (state, action, reward, next_state, done) in enumerate(minibatch):
-                state_batch[i, :] = state
-                target_batch[i, :] = self.predict_action(state)
-                target_batch[i, action] = reward if done else reward + self.gamma * np.amax(
-                    self.predict_action(next_state)[0])
-            self.model.fit(state_batch, target_batch, epochs=1, verbose=0)
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
-
-    def predict_action(self, state):  # 预测动作
-        return self.model.predict(state)
-
-    def act(self, state):  # 执行的动作，具有随机性
-        if random.random() < self.epsilon:
-            return random.randrange(self.action_size)
+    def learn(self):
+        # sample batch memory from all memory
+        if self.memory_counter > self.params['memory_size']:
+            sample_index = np.random.choice(self.params['memory_size'], size=self.params['batch_size'])
         else:
-            # print(self.predict_action(state))
-            return np.argmax(self.predict_action(state)[0])
+            sample_index = np.random.choice(self.memory_counter, size=self.params['batch_size'])
 
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-        # self._train()
+        batch_memory = self.memory[sample_index, :]
 
-    def save(self, name='models/test'):
-        self.model.save(name)
-        self.saveWeight(name)
+        q_next = self.target_model.predict(batch_memory[:, -self.params['n_features']:])
+        q_eval = self.eval_model.predict(batch_memory[:, :self.params['n_features']])
 
-    def load(self, name='models/test'):
-        self._model = load_model(name)
+        # change q_target w.r.t q_eval's action
+        q_target = q_eval.copy()
 
-    def saveWeight(self, name='models/test'):
-        self.model.save_weights(name + '.weight')
+        batch_index = np.arange(self.params['batch_size'], dtype=np.int32)
+        eval_act_index = batch_memory[:, self.params['n_features']].astype(int)
+        reward = batch_memory[:, self.params['n_features'] + 1]
 
-    def loadWeight(self, name='models/test'):
-        self.model.load_weights(name + '.weight')
+        q_target[batch_index, eval_act_index] = reward + self.params['reward_decay'] * np.max(q_next, axis=1)
+
+        # check to replace target parameters
+        if self.learn_step_counter % self.params['replace_target_iter'] == 0:
+            for eval_layer, target_layer in zip(self.eval_model.layers, self.target_model.layers):
+                target_layer.set_weights(eval_layer.get_weights())
+            print('\ntarget_params_replaced\n')
+
+        """
+        For example in this batch I have 2 samples and 3 actions:
+        q_eval =
+        [[1, 2, 3],
+         [4, 5, 6]]
+        q_target = q_eval =
+        [[1, 2, 3],
+         [4, 5, 6]]
+        Then change q_target with the real q_target value w.r.t the q_eval's action.
+        For example in:
+            sample 0, I took action 0, and the max q_target value is -1;
+            sample 1, I took action 2, and the max q_target value is -2:
+        q_target =
+        [[-1, 2, 3],
+         [4, 5, -2]]
+        So the (q_target - q_eval) becomes:
+        [[(-1)-(1), 0, 0],
+         [0, 0, (-2)-(6)]]
+        We then backpropagate this error w.r.t the corresponding action to network,
+        leave other action as error=0 cause we didn't choose it.
+        """
+
+        # train eval network
+
+        self.cost = self.eval_model.train_on_batch(batch_memory[:, :self.params['n_features']], q_target)
+
+        self.cost_his.append(self.cost)
+
+        # increasing epsilon
+        self.epsilon = self.epsilon + self.params['e_greedy_increment'] if self.epsilon < self.params['e_greedy'] \
+            else self.params['e_greedy']
+        self.learn_step_counter += 1
+
+    def plot_cost(self):
+        import matplotlib.pyplot as plt
+        plt.plot(np.arange(len(self.cost_his)), self.cost_his)
+        plt.ylabel('Cost')
+        plt.xlabel('training steps')
+        plt.show()
 
 
-if __name__ == '__main__':
-    saveModelName = 'models/test'
-    env = gym.make('CartPole-v0')
-    state_size = env.observation_space.shape[0]
-    action_size = env.action_space.n
-    agent = DQN(state_size, action_size, False)
-    for times in range(EPISODES):
-        state = env.reset().reshape(1, state_size)
-        for i in range(199):
-            action = agent.act(state)
-            next_state, reward, done, _ = env.step(action)
-            reward = 0.1 if not done else -1
-            next_state = next_state.reshape(1, state_size)
-            agent.remember(state, action, reward, next_state, done)
-            state = next_state
+def run_maze():
+    step = 0
+    for episode in range(300):
+        # initial observation
+        observation = env.reset()
+
+        while True:
+            # fresh env
+            env.render()
+            # RL choose action based on observation
+            action = RL.choose_action(observation)
+            # RL take action and get next observation and reward
+            observation_, reward, done = env.step(action)
+            RL.store_transition(observation, action, reward, observation_)
+            if (step > 200) and (step % 5 == 0):
+                RL.learn()
+            # swap observation
+            observation = observation_
+            # break while loop when end of this episode
             if done:
-                print('[times]:{}/{}\t\t[i]:{}\t\t[epsilon]:{}'.format(times, EPISODES, i, agent.epsilon))
                 break
-            if i == 198:
-                print('[times]:{}/{}\t\t[i]:{}\t\t[epsilon]:{}\t#success#'.format(times, EPISODES, i, agent.epsilon))
-        agent.train()
-        if (times + 1) % 100 == 0:
-            agent.save(saveModelName + str(times + 1))
-            print('[Saved] savename: `%s`' % (saveModelName + str(times + 1)))
+            step += 1
+    # end of game
+    print('game over')
+    env.destroy()
+
+
+if __name__ == "__main__":
+    # maze game
+    env = Maze()
+    eval_model = Eval_Model(num_actions=env.n_actions)
+    target_model = Target_Model(num_actions=env.n_actions)
+    RL = DeepQNetwork(env.n_actions, env.n_features, eval_model, target_model)
+    env.after(100, run_maze)
+    env.mainloop()
+    RL.plot_cost()
