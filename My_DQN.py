@@ -2,6 +2,7 @@ import gym
 import numpy as np
 import random
 from collections import deque
+import tensorflow as tf
 from tensorflow.keras import models
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
@@ -11,7 +12,7 @@ max_epoch = 1000
 max_step_epoch = 200
 param_reset_frequency = 20
 epsilon = 0.95
-memory_buffer_size = 2000
+memory_buffer_size = 200
 minibatch_size =100
 
 
@@ -56,10 +57,10 @@ class DQN:
     def learn(self):
         if self.memory_counter < memory_buffer_size:
             return
-        index = np.random.choice(self.max_memo_size, minibatch_size)
+        index = np.random.choice(memory_buffer_size, minibatch_size)
         training_sample = self.memory_state[index]
         training_target = self.memory_target[index]
-        self.eval_model().fit(training_sample, training_target, epochs=1, batch_size=32)
+        self.eval_model.fit(training_sample, training_target, epochs=1, batch_size=32)
 
     def restore_memeory(self, state, reward, action_index, next_state, done):
         index = self.memory_counter % memory_buffer_size
@@ -73,6 +74,7 @@ class DQN:
             Q = np.amax(self.policy_model.predict(next_state))
             target = reward + self.gamma_decay * Q
         self.memory_target[index] = target
+        self.memory_counter +=1
 
 
 def main():
@@ -85,12 +87,12 @@ def main():
         if episode % 2 == 1:
             weights = DQN_Network.eval_model.get_weights()
             DQN_Network.policy_model.set_weights(weights)
-
         for step in range(0, max_step_epoch):
             action = DQN_Network.act(cur_state)
             new_state, reward, done, _ = DQN_Network.env.step(action)
             new_state = new_state.reshape(1, DQN_Network.state_space_size)
             DQN_Network.restore_memeory(state=cur_state, reward=reward, action_index=action, done=done, next_state=new_state)
+            DQN_Network.learn()
             if done:
                 cur_state = env.reset().reshape(1, DQN_Network.state_space_size)
             else:
